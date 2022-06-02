@@ -5,7 +5,7 @@ Paths in R script will need tweaking for local user use.
 
 files:
 
-  #SNP calls for mitochondrial variants. Column = mtDNA position, row= fly line
+SNP calls for mitochondrial variants. Column = mtDNA position, row= fly line
 ABonly_mtAmtBsigdiff_major.csv
 
   #development time data after parental diet switch
