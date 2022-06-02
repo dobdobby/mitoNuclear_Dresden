@@ -1,0 +1,371 @@
+###############################
+# A # nuclear genome analysis #
+###############################
+
+
+#1# trim, map and re-align around InDels#
+#########################################
+
+#1.1# trim raw FASTQ reads for BQ >18 and minimum length > 50bp with cutadapt (version 2.4)
+#
+cutadapt -q 18 -m 50 \
+-o read1_trimmed.fq.gz \
+-p read2_trimmed.fq.gz 
+read1.fq.gz \
+read2.fq.gz
+
+#1.2# map trimmed reads with bwa (version 0.7.12-r1039)
+#
+bwa aln -t 6 -o 1 -l 200 -n 0.01 -d 12 -e 12 \
+reference.fasta read1_trimmed.fq.gz > read1.sai
+bwa aln -t 6 -o 1 -l 200 -n 0.01 -d 12 -e 12 \
+reference.fasta read2_trimmed.fq.gz > read2.sai
+bwa sampe reference.fasta read1.sai \
+read2.sai read1_trimmed.fq.gz read2_trimmed.fq.gz \
+> aln.sam 
+
+#1.3# filter for proper pairs with MQ > 20, remove unmapped reads with samtools (version 1.9)
+#
+samtools view -b -q 20 -f 0x002 -F 0x004 -F 0x008 \
+aln.sam > aln.bam 
+
+#1.4# sort BAM by reference position using picard (version 2.18.11)
+#
+java -Xmx10g -jar ~/picard.jar SortSam SORT_ORDER=coordinate \
+INPUT=aln.bam OUTPUT=aln_sort.bam 
+
+#1.5# remove duplicates with picard (version 2.18.11)
+#
+java -Xmx10g -jar ~/picard.jar MarkDuplicates INPUT=aln_sort.bam \
+OUTPUT=aln_dedup.bam  METRICS_FILE=aln_dedup.metrics REMOVE_DUPLICATES=true 
+
+#1.6# re-align sequences flanking indels
+#
+#add read group tags to BAM files (formats header for GATK) with picard (version 2.18.11)
+java -Xmx10g -jar ~/picard.jar AddOrReplaceReadGroups \
+RGLB=Lane1 RGPL=Illumina RGPU=TTAGGC RGSM=sample INPUT=aln_dedup.bam \
+OUTPUT=aln_dedup_gatk.bam 
+#index BAM files for GATK with picard (version 2.18.11)
+java -Xmx10g -jar ~/picard.jar BuildBamIndex \
+INPUT=aln_dedup_gatk.bam  
+#identify intervals to be realigned around indels with GATK (version 3.8.1.0)
+java -Xmx10g -jar ~/gatk-3.8.1.0/GenomeAnalysisTK.jar \
+-T RealignerTargetCreator -R reference.fasta \
+-I aln_dedup_gatk.bam -o aln_dedup_gatk.intervals 
+#re-align around InDels using GATK (version 3.8.1.0)
+java -Xmx10g -jar ~/gatk-3.8.1.0/GenomeAnalysisTK.jar \
+-T IndelRealigner -R dmel628shortheaders.fasta \
+-targetIntervals aln_dedup_gatk.intervals\
+-I aln_dedup_gatk.bam \
+-o aln_dedup_gatk_indel.bam 
+
+
+
+#2# SNP calling 
+################# 
+
+#2.1# merge BAM files in single mpileup file with BQ >20 MQ > 20 using samtools (version 1.9)
+#
+samtools mpileup -B  -q 20 -Q 20 -f reference.fasta -b BAMlist.txt |
+gzip > file.mpileup.gz
+
+#2.2#prepare reference including only  major chromosome (arms) using samtools (version 1.9)
+#
+samtools faidx reference.fasta X 2L 2R 3L 3R > reference_major.fasta
+
+
+#2.3# SNP calling using PoolSNP (version 1.05)
+#
+bash PoolSNP-master/PoolSNP.sh mpileup=file.mpileup.gz \
+output=snps reference=reference_major.fasta \
+names=AA1, AA2, AB1, AB2, AC1, AC3, BA2, BA3, BB1, BB3, BC1, BC2, CA2, CA3, CB2, CB3, CC1, CC2 \
+max-cov=0.95 min-cov=10 min-count=10 min-freq=0.001 miss-frac=0.2 jobs=6 BS=1 
+
+
+#2.4# identify sites in proximity of InDels with a minimum count of 10 across all samples pooled 
+#and mask sites 5bp up- and downstream of InDels using python script from the DrosEU pipeline
+#
+python ~/DrosEU_pipeline-master/scripts/DetectIndels.py \
+--mpileup file.mpileup.gz --minimum-count 10 --mask 5 |
+gzip > InDel-positions_10.txt.gz 
+
+
+#2.5# filter SNPs around InDels and in TEs 
+#
+#generate a GFF with location of known TEs using Repeatmasker (version 4.1.2)
+#obtain TE libraries:
+curl -O ftp://ftp.flybase.net/genomes/Drosophila_melanogaster//dmel_r6.28_FB2019_03/fasta/dmel-all-transposon-r6.28.fasta.gz
+curl -O ftp://ftp.flybase.net/genomes/Drosophila_melanogaster//dmel_r6.28_FB2019_03/fasta/dmel-all-chromosome-r6.28.fasta.gz
+#only keep contig name in headers (no spaces):
+awk '{print $1}' dmel-all-transposon-r6.28.fasta > dmel-all-transposon-r6.28_fixed-id.fasta
+#repeat mask D. melanogaster genome using Repeatmasker:
+RepeatMasker/RepeatMasker -pa 1 --lib dmel-all-transposon-r6.28_fixed-id.fasta \
+--gff --qq --no_is --nolow dmel-all-chromosome-r6.28.fasta
+#
+#removes sites that are located in InDels or TEs from VCF using python script from the DrosEU pipeline
+python ~/DrosEU_pipeline-master/scripts/FilterPosFromVCF.py \
+--indel InDel-positions_10.txt.gz --te dmel-all-chromosome-r6.28.fasta.out.gff \
+--vcf snps.vcf.gz | gzip > snps_clean.vcf.gz
+
+
+#2.6# annotate SNPs with snpEff (version 5.0e)
+#
+java -Xmx10g -jar snpEff/snpEff.jar -ud 2000 BDGP6.28.99 -stats \
+snps_clean.html snps_clean.vcf.gz | gzip > snps_clean_ann.vcf.gz
+
+
+
+#3# genetic differentiation analysis 
+####################################
+
+#3.1# convert VCF to SYNC using python script from the DrosEU pipeline
+#
+python ~/DrosEU_pipeline-master/scripts/VCF2sync.py --vcf snps_clean_ann.vcf.gz > snps.sync
+
+#3.2# filter SNPs to minimize effects of LD
+#
+#filter for SNPs at least 1kb apart: 
+#
+awk '$1=="2L"' snps.sync | awk 'f && $2-f<1000 {next} {print $0}; {f=$2}'  > snps_1kb_apart.sync
+awk '$1=="2R"' snps.sync | awk 'f && $2-f<1000 {next} {print $0}; {f=$2}'  >> snps_1kb_apart.sync
+awk '$1=="3L"' snps.sync | awk 'f && $2-f<1000 {next} {print $0}; {f=$2}'  >> snps_1kb_apart.sync
+awk '$1=="3R"' snps.sync| awk 'f && $2-f<1000 {next} {print $0}; {f=$2}'   >> snps_1kb_apart.sync
+awk '$1=="X"'  snps.sync | awk 'f && $2-f<1000 {next} {print $0}; {f=$2}'  >> snps_1kb_apart.sync
+#
+#excluding those in regions of zero recombination rate (acc. to Comeron et al. 2012):
+#
+#convert R6 to R5 positions (via http://flybase.org/convert/coords625) 
+awk '{print $1":"$2".."$2}' snps_1kb_apart.sync > snps_1kb_apart_pos
+#input: snps_1kb_apart_pos => snps_1kb_apart_pos_converted
+awk '!/R5:  \w/' snps_1kb_apart_pos_converted | awk '!/R5: \w/ {print $1"\t"$2}' |
+awk 'BEGIN {print "R6\tR5"}{print}' > snps_1kb_apart_pos_R6R5
+#get recomb rates for each snp - recombination rate calculator (version 2.3):
+awk 'NR>1 {print $2}' snps_1kb_apart_pos_R6R5 > snps_1kb_apart_pos_R5
+perl RRC-open-v2.3.pl -M snps_1kb_apart_pos_R5 
+awk 'BEGIN { FS="[:..\t]"}{OFS="\t"}{print $1,$2} ' snps_1kb_apart_pos_R6R5 | awk 'NR>1'  > snps_1kb_apart_pos
+awk 'BEGIN {OFS="\t"}{print $5,$2} '  snps_1kb_apart_pos_R5.rrc > snps_1kb_apart_pos_recomb_rate
+paste snps_1kb_apart_pos snps_1kb_apart_pos_recomb_rate | 
+awk 'BEGIN {print "chr\tposR6\tComeron2012\tFistonLavier2010"}{print}'> snps_1kb_apart_pos_recomb
+#filter out SNPs with zero recombination rate
+awk '$3>0  {print $1$2}' snps_1kb_apart_pos_recomb > snps_1kb_apart_pos_recomb_nonzero
+mapfile -t a < snps_1kb_apart_pos_recomb_nonzero 
+awk 'BEGIN {OFS="\t"}{print $1$2, $0}' snps_1kb_apart.sync > snps_1kb_apart
+for i in ${a[@]}; do awk -v i="$i" '($1==i)' snps_1kb_apart; done  |
+awk 'BEGIN {OFS="\t"}{print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22}' \
+> snps_1kb_apart_recomb_nonzero.sync
+
+#3.3# calculate major allele frequencies using python script from the DrosEU pipeline
+#
+python ~/DrosEU_pipeline-master/scripts/sync2AF.py --inp snps_1kb_apart_recomb_nonzero.sync \
+--out snps_1kb_apart_recomb_nonzero_af
+
+#3.4# PCA using R package LEA (version 3.4.0)
+#
+R
+library(LEA)
+#load data
+freq<-read.table("snps_1kb_apart_recomb_nonzero_af_freq.txt",header=F)
+lines<-c("AA1","AA2","AB1","AB2","AC1","AC3",
+		 "BA2","BA3","BB1","BB3","BC1","BC2",
+		 "CA2","CA3","CB2","CB3","CC1","CC2")
+rownames(freq)<-lines
+#calculate PCA
+write.lfmm(freq,"pca_nDNA.lfmm")
+pc<-pca("pca_nDNA.lfmm")
+comp <- data.frame(pc$eigenvectors[,1:4])
+#perform tracy-widom tests to calculate % of variance 
+#explained by each principal component
+tw<-tracy.widom(pc) 
+#write PCA scores of first 3 axes to text file
+nDNA<-c("A","A","B","B","C","C",
+		"A","A","B","B","C","C",
+		"A","A","B","B","C","C")
+pca_nDNA<-cbind(lines,nDNA,comp[,1],comp[,2],comp[,3])
+header<-c("lines", "nDNA", "pc1", "pc2", "pc3")
+colnames(pca_nDNA)<-header
+write.table(pca_nDNA,file="nDNA_PCAscores.txt", quote=F)
+
+
+#3.5# get admixture proportions using R package conStruct (version 1.0.4)
+#
+R
+library(conStruct)
+#Load data
+Freq<-read.table("snps_1kb_apart_recomb_nonzero_af_freq.txt",header=F)
+CoordRaw<-read.table("nDNAorigin_coords.txt",header=T)
+Coord<-as.matrix(CoordRaw[,3:2])
+#
+#run nonspatial model
+nDNA_K3 <- conStruct(spatial = FALSE,
+			K = 3,
+			freqs = as.matrix(Freq),
+			geoDist = NULL,
+			coords = Coord,
+			n.chains = 3,
+			prefix = "nDNA_structure_K3",
+			n.iter = 1e4,
+			make.figs = T,
+			save.files = T)
+
+
+
+
+#####################################
+# B # mitochondrial genome analysis #
+#####################################
+
+
+#1# filter BAM for mt genome using samtools (version 1.9)
+##########################################################
+#
+#BAM files from Vaught et al. 2019
+samtools view aln.bam mitochondrion_genome -b > aln_mt.bam
+
+
+#2# PCA 
+#########
+
+#2.1# merge BAM files in single mpileup file with BQ >20 using samtools (version 1.9)
+#
+samtools mpileup -B -d 5000 -Q 20 -f reference.fasta \
+-b BAMlist.txt  > file_mt_nonmergedBAMs.mpileup
+
+#2.2# convert mpileup file to SYNC with popoolation 2
+#
+java -jar ~/popoolation2_master/mpileup2sync.jar  \
+--min-qual 20 --threads 6 --input file_mt.mpileup \
+--output file_mt.sync 
+
+#2.3# calculate major allele frequencies using python script from the DrosEU pipeline 
+#
+python ~/DrosEU_pipeline-master/scripts/sync2AF.py \
+--inp file_mt.sync --out file_mt_af
+
+#2.4#  PCA using R package LEA (version 3.4.0)
+#
+R
+library(LEA)
+# load data
+freq=read.table("file_mt_af_freq.txt",header=F)
+lines<-c("AA1","AA2","AA3","AB1","AB2","AB3","AC1","AC2","AC3",
+		 "BA1","BA2","BA3","BB1","BB2","BB3","BC1","BC2","BC3",
+		 "CA1","CA2","CA3","CB1","CB2","CB3","CC1","CC2","CC3")
+rownames(freq)<-lines
+# calculate PCA
+write.lfmm(freq,"file_mt.lfmm")
+pc=pca("file_mt.lfmm")
+#perform tracy-widom tests to calculate % of variance 
+#explained by each principal component
+tw=tracy.widom(pc) 
+#write PCA scores of first 3 axes to text file
+mtDNA<-c("A","A","A","A","A","A","A","A","A",
+		 "B","B","B","B","B","B","B","B","B",
+		 "C","C","C","C","C","C","C","C","C")
+pca_mtDNA<-cbind(lines,mtDNA,comp[,1],comp[,2],comp[,3])
+header<-c("lines", "mtDNA", "pc1", "pc2", "pc3")
+colnames(pca_mtDNA)<-header
+write.table(pca_mtDNA,file="mtDNA_PCAscores.txt", quote=F)
+#
+
+
+
+#3# get admixture proportions using R package conStruct (version 1.0.4)
+######################################################################
+#
+R
+library(conStruct)
+#Load data
+Freq<-read.table("file_mt_af_freq.txt",header=F)
+CoordRaw<-read.table("mtDNAorigin_coords.txt",header=T)
+Coord<-as.matrix(CoordRaw[,3:2])
+#
+#run nonspatial model
+mtDNA_K3 <- conStruct(spatial = FALSE,
+			K = 3,
+			freqs = as.matrix(Freq),
+			geoDist = NULL,
+			coords = Coord,
+			n.chains = 3,
+			prefix = "mtDNA_structure_K3",
+			n.iter = 1e4,
+			make.figs = T,
+			save.files = T)
+
+
+
+
+
+#4# estimate FST with popoolation 2
+###################################
+#
+#merge BAM files per mitonucleotype with picard (version 2.18.11)
+java -Xmx8g -jar ~/picard.jar MergeSamFiles \
+INPUT=aln_mt_1.bam INPUT=aln_mt_2_mt.bam INPUT=aln_mt_3_mt.bam \
+OUTPUT=aln_mt_123.bam
+#
+#merge BAM files in single mpileup file with BQ >20 using samtools (version 1.9)
+samtools mpileup -B -d 5000 -Q 20 -f reference.fasta \
+-b BAMlist.txt  > file_mt_mergedBAMs.mpileup
+#
+#convert mpileup file to SYNC with popoolation 2
+java -jar ~/popoolation2_master/mpileup2sync.jar  \
+--min-qual 20 --threads 6 --input file_mt_mergedBAMs.mpileup \
+--output file_mt_mergedBAMs.sync 
+#
+#remove deletions 
+awk 'BEGIN {OFS="\t"}{for(i=4;i<=NF;i++) sub(/.$/,0,$i)}1' file_mt.sync | 
+awk 'BEGIN {OFS="\t"}{for(i=4;i<=NF;i++) sub(/[0-9]0$/,0,$i)}1' \
+> file_mt_mergedBAMs_nodel.sync
+#
+#filter for sites with at least 10x seq depth per mitonuclear replicate
+#
+perl ~/popoolation2_master/fst-sliding.pl \
+--window-size 1 --step-size 1  --min-covered-fraction 1.0 --min-coverage 10 \
+--max-coverage 5000 --min-count 1% --pool-size 900 --suppress-noninformative \
+--input file_mt.sync \
+--output file_mt.fst
+#
+cut -f 1,2 file_mt_from.fst > pos_atleast10x_per_repl
+grep -w -f pos_atleast10x_per_repl file_mt_mergedBAMs_nodel.sync \
+> file_mt_mergedBAMs_nodel10x.sync
+#
+#calculate FST with popoolation 2
+perl ~/popoolation2_master/fst-sliding.pl \
+--window-size 1 --step-size 1  --min-covered-fraction 1.0 --min-coverage 30 \
+--max-coverage 5000 --min-count 1% --pool-size 450 --suppress-noninformative \
+--input file_mt_mergedBAMs_nodel10x.sync \
+--output file_mt.fst
+
+
+#5# Fisher's exact test to estimate the significance of 
+#allele frequency differences with popoolation 2
+#########################################################
+#
+perl  ~/popoolation2_master/fisher-test.pl \
+--window-size 1 --step-size 1 --min-covered-fraction 1.0 --min-coverage 30 \
+--max-coverage 5000 --min-count 1% --suppress-noninformative \
+--input file_mt_mergedBAMs_nodel10x.sync \
+--output file_mt.fet
+#
+#calculate FDR in R
+R
+fet_p_minuslog<-read.table("all_fet")
+fet_p <- 10^(-(fet_p_minuslog))
+p.adjust(fet_p,"fdr") 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
